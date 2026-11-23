@@ -539,7 +539,7 @@ def _message_json(conn, row) -> dict:
 
 
 def _mention_names(text: str) -> list[str]:
-    return []  # filled in by the mentions section
+    return parse_mentions(text)
 
 
 def _message_row(conn, actor: Participant, message_id: int):
@@ -594,12 +594,68 @@ def send_message(db: Database, actor: Participant, thread: str, text: str, kind:
         return _message_json(c, _message_row(c, actor, mid))
 
 
+# --- mentions ---------------------------------------------------------------
+
+MENTION_RE = re.compile(r"(?<![\w@.])@([A-Za-z0-9][A-Za-z0-9_-]{0,31})")
+REPORT_UP = "Workers can't message other workers. Address @lead, @reviewer, or @human, or post a proposal to @lead."
+REPORT_UP_FIX = 'grid chat send project "<text>" --propose'
+
+
+def parse_mentions(text: str) -> list[str]:
+    out: list[str] = []
+    for m in MENTION_RE.finditer(text):
+        name = m.group(1).lower()
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def resolve_mentions(conn, project_id: int, names: list[str]) -> list[tuple[int, str | None]]:
+    people = conn.execute("SELECT id, name, kind, role FROM participants WHERE project_id=? AND active=1",
+                          (project_id,)).fetchall()
+    by_name = {p["name"]: p for p in people}
+    out, unknown = [], []
+    for n in names:
+        if n in ROLES:
+            out += [(p["id"], n) for p in people if p["role"] == n]
+        elif n == "human":
+            out += [(p["id"], "human") for p in people if p["kind"] == "human"]
+        elif n in by_name:
+            out.append((by_name[n]["id"], None))
+        else:
+            unknown.append(n)
+    if unknown:
+        valid = " ".join(f"@{p['name']}" for p in people) + " @lead @worker @reviewer @human"
+        raise GridError(422, "unknown_mention",
+                        f"Unknown mention: {', '.join('@' + u for u in unknown)}. Valid: {valid}.",
+                        "grid participants")
+    return out
+
+
+def check_worker_rules(conn, actor: Participant, task_id: int | None, names: list[str]) -> None:
+    if actor.role != "worker":
+        return
+    if task_id is not None:
+        owner = conn.execute("SELECT owner_id FROM tasks WHERE id=?", (task_id,)).fetchone()["owner_id"]
+        if owner != actor.id:
+            raise GridError(403, "not_your_task", f"T-{task_id} isn't your task, so you can't post there. "
+                            + REPORT_UP, REPORT_UP_FIX)
+    workers = {r["name"] for r in conn.execute(
+        "SELECT name FROM participants WHERE project_id=? AND role='worker'", (actor.project_id,))}
+    if "worker" in names or any(n in workers for n in names):
+        raise GridError(403, "workers_report_up", REPORT_UP, REPORT_UP_FIX)
+
+
 def _check_mentions(conn, actor: Participant, task_id: int | None, text: str) -> None:
-    pass  # filled in by the mentions section
+    names = parse_mentions(text)
+    check_worker_rules(conn, actor, task_id, names)
+    resolve_mentions(conn, actor.project_id, names)
 
 
 def _store_mentions(conn, actor: Participant, message_id: int, text: str) -> None:
-    pass  # filled in by the mentions section
+    rows = resolve_mentions(conn, actor.project_id, parse_mentions(text))
+    conn.executemany("INSERT INTO mentions (message_id, recipient_id, via_role) VALUES (?, ?, ?)",
+                     [(message_id, rid, via) for rid, via in dict.fromkeys(rows)])
 
 
 def read_messages(db: Database, actor: Participant, thread: str, since: int = 0, limit: int = 50,

@@ -1,6 +1,6 @@
 import pytest
 
-from grid.core import SCHEMA, Database, GridError, normalize_path, parse_scope, paths_overlap
+from grid.core import SCHEMA, Database, GridError, normalize_path, parse_scope, paths_overlap, parse_mentions
 from conftest import assign, mk, read, send
 
 
@@ -251,3 +251,44 @@ def test_no_edit_route(app):                                            # spec 1
     for route in app.routes:
         if "/messages" in getattr(route, "path", ""):
             assert not ({"PUT", "PATCH"} & set(getattr(route, "methods", set())))
+
+
+# --- Task 4: mentions and "workers report up" --------------------------------
+
+def mention_rows(app, mid):
+    with app.state.db.read() as c:
+        return {(r["name"], r["via_role"]) for r in c.execute(
+            "select p.name, m.via_role from mentions m join participants p on p.id = m.recipient_id where m.message_id=?", (mid,))}
+
+
+def test_mentions_stored(api, seed, app):                                 # spec 14
+    m = send(api, seed.lead, "project", "@frontend @reviewer @human ping").json()
+    assert mention_rows(app, m["id"]) == {("frontend", None), ("checker", "reviewer"), ("alice", "human")}
+    r = send(api, seed.lead, "project", "@ghost hi").json()
+    assert r["error"] == "unknown_mention" and "@frontend" in r["message"]
+
+
+def test_role_change_keeps_stored_recipients(api, seed, app):             # spec 14
+    m = send(api, seed.human, "project", "@lead hi").json()
+    api.delete("/participants/planner", headers=seed.h(seed.human))
+    api.post("/participants", json={"name": "lead2", "role": "lead"}, headers=seed.h(seed.human))
+    assert mention_rows(app, m["id"]) == {("planner", "lead")}
+
+
+def test_mention_parsing_edges(api, seed):                                 # Review Focus 4
+    assert parse_mentions("mail alice@frontend.com now") == []
+    assert parse_mentions("hey @Frontend, and @frontend.") == ["frontend"]
+    api.delete("/participants/backend", headers=seed.h(seed.human))
+    assert send(api, seed.lead, "project", "@backend hi").json()["error"] == "unknown_mention"
+
+
+def test_workers_report_up(api, seed):                                     # spec 15
+    t1 = mk(api, seed, "A", ["a/"]); assign(api, seed, t1, "frontend")
+    t2 = mk(api, seed, "B", ["b/"]); assign(api, seed, t2, "backend")
+    for text in ("@backend look", "@worker anyone?"):
+        r = send(api, seed.frontend, t1["id"], text).json()
+        assert r["error"] == "workers_report_up" and "@lead" in r["message"]
+    assert send(api, seed.frontend, t2["id"], "hi").json()["error"] == "not_your_task"
+    for thread in (t1["id"], "project"):
+        assert send(api, seed.frontend, thread, "@lead @reviewer @human q").status_code == 200
+    assert send(api, seed.reviewer, t2["id"], "@backend fyi").status_code == 200
