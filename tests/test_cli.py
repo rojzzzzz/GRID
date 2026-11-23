@@ -1,6 +1,11 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
 
 import pytest
+
+from conftest import seed_over_http
 
 
 # --- Task 5: CLI ---------------------------------------------------------------
@@ -45,3 +50,57 @@ def test_errors_show_fix(cli, seed):
 def test_join_prints_token_last(cli, seed):
     token = cli("join", "--role", "worker", "--name", "qa", "--tool", "codex", token=seed.human).stdout.strip().splitlines()[-1]
     assert token.startswith("grid_") and cli("whoami", token=token).exit_code == 0
+
+
+# --- Task 6: concurrency and the Stage 1 end-to-end check -----------------------
+
+def test_parallel_sends(live_server):                                      # spec 21
+    tokens = seed_over_http(live_server)
+
+    def go(i):
+        return httpx.post(f"{live_server}/threads/project/messages", json={"text": f"m{i}"},
+                          headers={"Authorization": f"Bearer {tokens[i % 4]}"}).status_code
+
+    with ThreadPoolExecutor(8) as ex:
+        assert list(ex.map(go, range(20))) == [200] * 20
+    ids = [m["id"] for m in httpx.get(f"{live_server}/threads/project/messages",
+                                      headers={"Authorization": f"Bearer {tokens[0]}"}).json()["messages"]]
+    assert len(ids) == 20 and ids == sorted(set(ids))
+
+
+def test_stage1_end_to_end(cli):                                            # spec end-to-end check
+    def ok(*args, token=None):
+        r = cli(*args, token=token)
+        assert r.exit_code == 0, r.stderr
+        return r
+
+    def last_line(r):
+        return r.stdout.strip().splitlines()[-1]
+
+    def msgs(thread, *extra, token):
+        return json.loads(ok("chat", "read", thread, *extra, "--json", token=token).stdout)["messages"]
+
+    human = last_line(ok("init", "--project", "Web app MVP", "--human", "alice"))
+    lead = last_line(ok("join", "--role", "lead", "--name", "planner", "--tool", "opus", token=human))
+    fe = last_line(ok("join", "--role", "worker", "--name", "frontend", "--tool", "deepseek", token=human))
+    ok("join", "--role", "worker", "--name", "backend", "--tool", "codex", token=human)
+    rev = last_line(ok("join", "--role", "reviewer", "--name", "checker", "--tool", "codex", token=human))
+
+    ok("task", "create", "Login form", "--scope", "web/login/", token=lead)
+    ok("task", "create", "Auth API", "--scope", "api/auth/", token=lead)
+    ok("task", "assign", "T-1", "frontend", token=lead)
+    ok("task", "assign", "T-2", "backend", token=lead)
+    ok("task", "review", "T-1", "--reviewer", "checker", token=lead)
+
+    q = json.loads(ok("chat", "send", "T-1", "@reviewer rate-limit on client?", "--question", "--json",
+                      token=fe).stdout)
+    ok("chat", "send", "T-1", "No, server side.", "--reply-to", str(q["id"]), token=rev)
+    ok("chat", "send", "project", "Use session cookies.", "--decide", token=lead)
+
+    r = cli("chat", "send", "T-1", "@backend can you check the API?", token=fe)
+    assert r.exit_code == 1 and "@lead" in r.stderr
+
+    assert [m["text"] for m in msgs("T-1", token=lead)] == ["@reviewer rate-limit on client?", "No, server side."]
+    assert [(m["kind"], m["text"]) for m in msgs("project", token=lead)] == [("decision", "Use session cookies.")]
+    assert msgs("T-2", token=lead) == []
+    assert msgs("T-1", "--open", token=lead) == []

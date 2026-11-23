@@ -86,3 +86,41 @@ def cli(api, monkeypatch):
 
     yield run
     grid_cli.set_client_factory(None)
+
+
+def seed_over_http(base_url):
+    import httpx
+
+    human = httpx.post(f"{base_url}/init", json={"project": "P", "human": "alice"}).json()["token"]
+    tokens = []
+    for i in range(4):
+        r = httpx.post(f"{base_url}/participants", json={"name": f"w{i}", "role": "worker", "tool": "t"},
+                       headers=Seed.h(human))
+        tokens.append(r.json()["token"])
+    return tokens
+
+
+@pytest.fixture
+def live_server(tmp_path):
+    import socket
+    import threading
+    import time
+
+    import httpx
+    import uvicorn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(create_app(tmp_path / "live.db"), host="127.0.0.1", port=port,
+                                           log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    url = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        try:
+            if httpx.get(f"{url}/health").status_code == 200:
+                break
+        except httpx.TransportError:
+            time.sleep(0.05)
+    yield url
+    server.should_exit = True
