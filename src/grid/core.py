@@ -506,3 +506,128 @@ def list_tasks(db: Database, actor: Participant) -> list[dict]:
     with db.read() as c:
         rows = c.execute("SELECT * FROM tasks WHERE project_id=? ORDER BY id", (actor.project_id,)).fetchall()
         return [_task_json(c, r) for r in rows]
+
+
+# --- messages ---------------------------------------------------------------
+
+KINDS = ("note", "question", "proposal", "decision")
+
+# A question is open while unresolved and unanswered by anyone but its asker.
+_OPEN_SQL = ("(m.kind = 'question' AND m.resolved_at IS NULL AND NOT EXISTS ("
+             "SELECT 1 FROM messages r WHERE r.reply_to = m.id AND r.author_id != m.author_id))")
+
+
+def _thread(conn, actor: Participant, thread: str) -> int | None:
+    if thread == "project":
+        return None
+    try:
+        return _task_row(conn, actor, parse_task_id(thread))["id"]
+    except GridError:
+        raise GridError(404, "no_such_thread", f"There is no thread '{thread}'. Use 'project' or a task id.",
+                        "grid task list") from None
+
+
+def _message_json(conn, row) -> dict:
+    a = conn.execute("SELECT * FROM participants WHERE id=?", (row["author_id"],)).fetchone()
+    is_open = conn.execute(f"SELECT {_OPEN_SQL} FROM messages m WHERE m.id=?", (row["id"],)).fetchone()[0]
+    return {"id": row["id"], "thread": f"T-{row['task_id']}" if row["task_id"] else "project",
+            "kind": row["kind"], "text": row["text"],
+            "author": {"name": a["name"], "kind": a["kind"], "role": a["role"], "tool": a["tool"]},
+            "reply_to": row["reply_to"], "resolved_at": row["resolved_at"],
+            "superseded_by": row["superseded_by"], "open": bool(is_open),
+            "mentions": _mention_names(row["text"]), "created_at": row["created_at"]}
+
+
+def _mention_names(text: str) -> list[str]:
+    return []  # filled in by the mentions section
+
+
+def _message_row(conn, actor: Participant, message_id: int):
+    row = conn.execute("SELECT * FROM messages WHERE id=? AND project_id=?",
+                       (message_id, actor.project_id)).fetchone()
+    if not row:
+        raise GridError(404, "no_such_message", f"There is no message #{message_id}.")
+    return row
+
+
+def send_message(db: Database, actor: Participant, thread: str, text: str, kind: str = "note",
+                 reply_to: int | None = None, supersedes: int | None = None,
+                 idempotency_key: str | None = None) -> dict:
+    if kind not in KINDS:
+        raise GridError(422, "bad_kind", f"Message kind must be one of: {', '.join(KINDS)}.")
+    if not text or not text.strip():
+        raise GridError(422, "empty_message", "A message needs some text.")
+    if kind == "decision":
+        require_lead_or_human(actor, "post decisions")
+    with db.tx() as c:
+        task_id = _thread(c, actor, thread)
+        cap = _settings(c, actor.project_id)["message_cap"]
+        if len(text) > cap:
+            raise GridError(422, "too_long", f"Message is {len(text):,} characters; the limit is {cap:,}. "
+                            "Link to a file, commit, or task output instead of pasting it.")
+        if idempotency_key:
+            seen = c.execute("SELECT * FROM messages WHERE author_id=? AND idempotency_key=?",
+                             (actor.id, idempotency_key)).fetchone()
+            if seen:
+                return _message_json(c, seen)
+        if reply_to is not None:
+            target = _message_row(c, actor, reply_to)
+            if target["task_id"] != task_id:
+                where = f"T-{target['task_id']}" if target["task_id"] else "project"
+                raise GridError(422, "bad_reply", f"#{reply_to} is in the {where} thread, not {thread}. "
+                                "Reply in the same thread.")
+            reply_to = target["reply_to"] or target["id"]  # one level: attach to the root
+        if supersedes is not None:
+            old = c.execute("SELECT * FROM messages WHERE id=? AND project_id=?",
+                            (supersedes, actor.project_id)).fetchone()
+            if kind != "decision" or not old or old["kind"] != "decision" or old["superseded_by"]:
+                raise GridError(422, "bad_supersede", "Only a new decision can replace a current decision "
+                                f"(D-{supersedes} isn't one).", "grid chat read project")
+        _check_mentions(c, actor, task_id, text)
+        mid = c.execute(
+            "INSERT INTO messages (project_id, task_id, author_id, kind, text, reply_to, idempotency_key, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (actor.project_id, task_id, actor.id, kind, text, reply_to, idempotency_key, now())).lastrowid
+        _store_mentions(c, actor, mid, text)
+        if supersedes is not None:
+            c.execute("UPDATE messages SET superseded_by=? WHERE id=?", (mid, supersedes))
+        return _message_json(c, _message_row(c, actor, mid))
+
+
+def _check_mentions(conn, actor: Participant, task_id: int | None, text: str) -> None:
+    pass  # filled in by the mentions section
+
+
+def _store_mentions(conn, actor: Participant, message_id: int, text: str) -> None:
+    pass  # filled in by the mentions section
+
+
+def read_messages(db: Database, actor: Participant, thread: str, since: int = 0, limit: int = 50,
+                  open_only: bool = False) -> dict:
+    limit = max(1, min(int(limit), 200))
+    with db.tx() as c:
+        task_id = _thread(c, actor, thread)
+        sql = "SELECT m.* FROM messages m WHERE m.project_id=? AND m.task_id IS ? AND m.id > ?"
+        if open_only:
+            sql += f" AND {_OPEN_SQL}"
+        rows = c.execute(sql + " ORDER BY m.id LIMIT ?", (actor.project_id, task_id, since, limit + 1)).fetchall()
+        more, rows = len(rows) > limit, rows[:limit]
+        if rows:
+            c.execute("INSERT INTO read_cursors (participant_id, project_id, task_id, last_message_id) "
+                      "VALUES (?, ?, ?, ?) ON CONFLICT (participant_id, project_id, COALESCE(task_id, 0)) "
+                      "DO UPDATE SET last_message_id = MAX(last_message_id, excluded.last_message_id)",
+                      (actor.id, actor.project_id, task_id, rows[-1]["id"]))
+        return {"messages": [_message_json(c, r) for r in rows],
+                "next_since": rows[-1]["id"] if more else None}
+
+
+def resolve_question(db: Database, actor: Participant, message_id: int) -> dict:
+    with db.tx() as c:
+        row = _message_row(c, actor, message_id)
+        if row["kind"] != "question":
+            raise GridError(422, "not_a_question", f"#{message_id} isn't a question.")
+        if row["author_id"] != actor.id:
+            raise GridError(403, "not_your_question", f"Only the asker can resolve #{message_id}. "
+                            "Reply to it instead.", f'grid chat send <thread> "<answer>" --reply-to {message_id}')
+        c.execute("UPDATE messages SET resolved_at=? WHERE id=?", (now(), message_id))
+        return _message_json(c, _message_row(c, actor, message_id))

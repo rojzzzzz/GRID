@@ -58,3 +58,14 @@ def mk(api, seed, title, scope):
 
 def assign(api, seed, task, owner, **kw):
     return api.post(f"/tasks/{task['id']}/assign", json={"owner": owner, **kw}, headers=Seed.h(seed.lead))
+
+
+def send(api, token, thread, text, **fields):
+    return api.post(f"/threads/{thread}/messages", json={"text": text, **fields}, headers=Seed.h(token))
+
+
+def read(api, token, thread, open=False):
+    params = {"open": "true"} if open else {}
+    r = api.get(f"/threads/{thread}/messages", params=params, headers=Seed.h(token))
+    assert r.status_code == 200, r.text
+    return r.json()["messages"]

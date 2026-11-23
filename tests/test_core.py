@@ -1,7 +1,7 @@
 import pytest
 
 from grid.core import SCHEMA, Database, GridError, normalize_path, parse_scope, paths_overlap
-from conftest import assign, mk
+from conftest import assign, mk, read, send
 
 
 # --- Task 1: skeleton, database, identity -----------------------------------
@@ -161,3 +161,93 @@ def test_rescoping_active_task_is_checked(api, seed):
     t1 = mk(api, seed, "A", ["api/"]); assign(api, seed, t1, "frontend")
     t2 = mk(api, seed, "B", ["web/"]); assign(api, seed, t2, "backend")
     assert api.put(f"/tasks/{t2['id']}/scope", json={"scope": ["api/x.py"]}, headers=seed.h(seed.lead)).status_code == 409
+
+
+# --- Task 3: messages, replies, questions, decisions -------------------------
+
+def test_threads_are_separate(api, seed):                              # spec 9
+    t1 = mk(api, seed, "A", ["a/"])
+    send(api, seed.lead, "project", "p"); send(api, seed.lead, t1["id"], "t")
+    assert [m["text"] for m in read(api, seed.lead, "project")] == ["p"]
+    assert [m["text"] for m in read(api, seed.lead, t1["id"])] == ["t"]
+
+
+def test_size_cap_default_and_setting(api, seed):                      # spec 10
+    assert send(api, seed.lead, "project", "x" * 2000).status_code == 200
+    r = send(api, seed.lead, "project", "x" * 2001).json()
+    assert r["error"] == "too_long" and "2,000" in r["message"] and "Link" in r["message"]
+    api.patch("/project/settings", json={"key": "message_cap", "value": 500}, headers=seed.h(seed.lead))
+    assert send(api, seed.lead, "project", "x" * 501).status_code == 422
+
+
+def test_cap_counts_characters(api, seed):                             # Review Focus 5
+    assert send(api, seed.lead, "project", "😀" * 2000).status_code == 200
+
+
+def test_decide_permission(api, seed):                                  # spec 3
+    for tok in (seed.frontend, seed.reviewer):
+        assert send(api, tok, "project", "d", kind="decision").status_code == 403
+    for tok in (seed.lead, seed.human):
+        assert send(api, tok, "project", "d", kind="decision").status_code == 200
+
+
+def test_idempotency(api, seed):                                        # spec 16
+    a = send(api, seed.lead, "project", "x", idempotency_key="k1").json()
+    b = send(api, seed.lead, "project", "x", idempotency_key="k1").json()
+    assert a["id"] == b["id"] and len(read(api, seed.lead, "project")) == 1
+
+
+def test_since_and_paging(api, seed):                                   # spec 17
+    for i in range(120): send(api, seed.lead, "project", f"m{i}")
+    seen, since = [], 0
+    while True:
+        page = api.get(f"/threads/project/messages?since={since}&limit=50", headers=seed.h(seed.lead)).json()
+        seen += [m["text"] for m in page["messages"]]
+        if page["next_since"] is None: break
+        since = page["next_since"]
+    assert seen == [f"m{i}" for i in range(120)]
+    assert all(m["id"] > 100 for m in api.get("/threads/project/messages?since=100", headers=seed.h(seed.lead)).json()["messages"])
+
+
+def test_unknown_thread_and_bad_kind(api, seed):
+    assert send(api, seed.lead, "T-999", "x").json()["error"] == "no_such_thread"
+    assert send(api, seed.lead, "project", "x", kind="order").json()["error"] == "bad_kind"
+    assert send(api, seed.lead, "project", "").json()["error"] == "empty_message"
+
+
+def test_reply_must_be_same_thread(api, seed):                          # spec 11
+    t1 = mk(api, seed, "A", ["a/"])
+    p = send(api, seed.lead, "project", "root").json()
+    assert send(api, seed.lead, t1["id"], "x", reply_to=p["id"]).json()["error"] == "bad_reply"
+
+
+def test_reply_to_reply_points_to_root(api, seed):
+    root = send(api, seed.lead, "project", "root").json()
+    r1 = send(api, seed.human, "project", "r1", reply_to=root["id"]).json()
+    assert send(api, seed.lead, "project", "r2", reply_to=r1["id"]).json()["reply_to"] == root["id"]
+
+
+def test_question_open_until_reply_or_resolve(api, seed):               # spec 12
+    q1 = send(api, seed.lead, "project", "q1?", kind="question").json()
+    q2 = send(api, seed.lead, "project", "q2?", kind="question").json()
+    send(api, seed.lead, "project", "self-reply", reply_to=q1["id"])
+    assert {m["id"] for m in read(api, seed.lead, "project", open=True)} == {q1["id"], q2["id"]}
+    send(api, seed.human, "project", "answer", reply_to=q1["id"])
+    assert api.post(f"/messages/{q2['id']}/resolve", headers=seed.h(seed.human)).json()["error"] == "not_your_question"
+    api.post(f"/messages/{q2['id']}/resolve", headers=seed.h(seed.lead))
+    assert read(api, seed.lead, "project", open=True) == []
+
+
+def test_supersede(api, seed):                                           # spec 13
+    d3 = send(api, seed.lead, "project", "cookies", kind="decision").json()
+    d4 = send(api, seed.lead, "project", "jwt", kind="decision", supersedes=d3["id"]).json()
+    assert {m["id"]: m for m in read(api, seed.lead, "project")}[d3["id"]]["superseded_by"] == d4["id"]
+    n = send(api, seed.lead, "project", "note").json()
+    for kind, target in (("decision", n["id"]), ("note", d4["id"]), ("decision", d3["id"])):
+        assert send(api, seed.lead, "project", "x", kind=kind, supersedes=target).json()["error"] == "bad_supersede"
+
+
+def test_no_edit_route(app):                                            # spec 13
+    for route in app.routes:
+        if "/messages" in getattr(route, "path", ""):
+            assert not ({"PUT", "PATCH"} & set(getattr(route, "methods", set())))

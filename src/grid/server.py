@@ -100,4 +100,19 @@ def create_app(db_path: Path) -> FastAPI:
     def status(tid: str, body: dict, actor: Participant = Depends(me)):
         return core.set_status(db, actor, core.parse_task_id(tid), body.get("status", ""))
 
+    # messages (no route edits a message: decisions are superseded, never changed)
+    @app.post("/threads/{thread}/messages")
+    def send(thread: str, body: dict, actor: Participant = Depends(me)):
+        return core.send_message(db, actor, thread, body.get("text", ""), body.get("kind") or "note",
+                                 body.get("reply_to"), body.get("supersedes"), body.get("idempotency_key"))
+
+    @app.get("/threads/{thread}/messages")
+    def read(thread: str, since: int = 0, limit: int = 50, open: bool = False,
+             actor: Participant = Depends(me)):
+        return core.read_messages(db, actor, thread, since, limit, open)
+
+    @app.post("/messages/{mid}/resolve")
+    def resolve(mid: int, actor: Participant = Depends(me)):
+        return core.resolve_question(db, actor, mid)
+
     return app
