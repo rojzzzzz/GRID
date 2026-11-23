@@ -292,3 +292,58 @@ def test_workers_report_up(api, seed):                                     # spe
     for thread in (t1["id"], "project"):
         assert send(api, seed.frontend, thread, "@lead @reviewer @human q").status_code == 200
     assert send(api, seed.reviewer, t2["id"], "@backend fyi").status_code == 200
+
+
+# --- Final review fixes ----------------------------------------------------------
+
+def test_scope_dot_segments_root_globs_and_case():
+    assert normalize_path("api/./auth") == "api/auth" and normalize_path("./") == "."
+    assert paths_overlap(".", "api") and paths_overlap("api/x", ".")
+    assert paths_overlap("API/Auth", "api/auth/x.py")
+    for bad in ("api/*", "~/x", "a?b"):
+        with pytest.raises(GridError): normalize_path(bad)
+
+
+def test_blocked_task_keeps_its_scope(api, seed):
+    t1 = mk(api, seed, "A", ["api/auth/"]); assign(api, seed, t1, "frontend")
+    t0 = mk(api, seed, "Z", ["z/"])
+    api.post(f"/tasks/{t1['id']}/depends", json={"on": t0["id"]}, headers=seed.h(seed.lead))
+    assert api.get(f"/tasks/{t1['id']}", headers=seed.h(seed.lead)).json()["status"] == "blocked"
+    assert assign(api, seed, mk(api, seed, "B", ["api/auth/session.py"]), "backend").status_code == 409
+
+
+def test_open_filter_does_not_advance_read_cursor(api, seed, app):
+    send(api, seed.lead, "project", "q?", kind="question")
+    send(api, seed.lead, "project", "note")
+    read(api, seed.backend, "project", open=True)
+    with app.state.db.read() as c:
+        assert c.execute("select count(*) from read_cursors").fetchone()[0] == 0
+
+
+def test_last_human_cannot_be_revoked(api, seed):
+    r = api.delete("/participants/alice", headers=seed.h(seed.human))
+    assert r.status_code == 409 and r.json()["error"] == "last_human"
+
+
+def test_safety_settings_humans_only_and_validated(api, seed):
+    patch = lambda tok, k, v: api.patch("/project/settings", json={"key": k, "value": v}, headers=seed.h(tok))
+    for key in ("require_review", "loop_guard_limit"):
+        assert patch(seed.lead, key, 1).status_code == 403
+        assert patch(seed.human, key, 1).status_code == 200
+    assert patch(seed.human, "require_review", 7).json()["error"] == "bad_setting"
+    assert patch(seed.lead, "message_cap", 0).json()["error"] == "bad_setting"
+
+
+def test_names_titles_tools_reject_control_characters(api, seed):
+    join = lambda body: api.post("/participants", json=body, headers=seed.h(seed.human))
+    assert join({"name": "evil\n", "role": "worker"}).status_code == 422
+    assert join({"name": "lead\n", "role": "worker"}).status_code == 422
+    assert join({"name": "qa", "role": "worker", "tool": "x\nerror: y"}).status_code == 422
+    assert api.post("/tasks", json={"title": "Fix\nerror: y"}, headers=seed.h(seed.lead)).status_code == 422
+
+
+def test_mentions_ignore_code_and_bad_lengths():
+    assert parse_mentions("use `@dataclass` here") == []
+    assert parse_mentions("```\n@pytest.fixture\ndef f(): ...\n```\nthanks @frontend") == ["frontend"]
+    assert parse_mentions("ping @frontend-") == ["frontend"]
+    assert parse_mentions("@" + "a" * 40) == ["a" * 40]

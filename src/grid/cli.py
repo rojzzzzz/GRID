@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -45,9 +46,9 @@ def _url() -> str:
 
 
 def _fail(message: str, fix: str | None = None) -> None:
-    typer.echo(f"error: {message}", err=True)
+    typer.echo(f"error: {_visible(message)}", err=True)
     if fix:
-        typer.echo(f"  fix: {fix}", err=True)
+        typer.echo(f"  fix: {_visible(fix)}", err=True)
     raise typer.Exit(1)
 
 
@@ -79,8 +80,22 @@ def _out(data: dict, as_json: bool, text: Callable[[dict], str]) -> None:
 
 # --- rendering ------------------------------------------------------------------
 
+# Anything that could move the cursor, erase the frame, or start a new line in a terminal
+# or an agent's reader. Tabs are kept. Line breaks are handled by str.splitlines() first.
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f  ]")
+
+
+def _visible(s: str) -> str:
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(s))
+
+
+def frame(text: str) -> str:
+    """Every line of participant-written text gets the frame; nothing can escape it."""
+    return "\n".join(FRAME + _visible(line) for line in (text.splitlines() or [""]))
+
+
 def render_message(m: dict) -> str:
-    a = m["author"]
+    a = {k: _visible(v) if isinstance(v, str) else v for k, v in m["author"].items()}
     parts = [f"#{m['id']}  @{a['name']} ({a['tool']})", a["kind"], m["kind"]]
     if m["kind"] == "decision":
         parts.append(f"D-{m['id']}")
@@ -91,14 +106,13 @@ def render_message(m: dict) -> str:
     if m.get("open"):
         parts.append("open")
     parts.append(m["created_at"])
-    body = "\n".join(FRAME + line for line in m["text"].split("\n"))
-    return " · ".join(parts) + "\n" + body
+    return " · ".join(parts) + "\n" + frame(m["text"])
 
 
 def render_task(t: dict) -> str:
     owner = f"@{t['owner']}" if t["owner"] else "—"
-    scope = " ".join(t["scope"]) or "none"
-    line = f"{t['id']}  {t['title']}  {owner}  {t['status']}  scope: {scope}"
+    scope = _visible(" ".join(t["scope"])) or "none"
+    line = f"{t['id']}  {_visible(t['title'])}  {owner}  {t['status']}  scope: {scope}"
     if t.get("reviewer"):
         line += f"  reviewer: @{t['reviewer']}"
     if t.get("depends_on"):
@@ -109,7 +123,7 @@ def render_task(t: dict) -> str:
 def render_participant(p: dict) -> str:
     role = f" · {p['role']}" if p.get("role") else ""
     revoked = " · revoked" if p.get("active") is False else ""
-    return f"@{p['name']} ({p['tool']}) · {p['kind']}{role}{revoked}"
+    return _visible(f"@{p['name']} ({p['tool']}) · {p['kind']}{role}{revoked}")
 
 
 def _joined(data: dict) -> str:
@@ -179,8 +193,8 @@ def participants(as_json: bool = JsonOpt):
 def activity(task: Optional[str] = typer.Argument(None), as_json: bool = JsonOpt):
     """Show the activity log, for the project or one task."""
     def text(d):
-        return "\n".join(f"{e['created_at']}  @{e['actor']}  {e['action']}  {e['task'] or ''}  "
-                         f"{json.dumps(e['detail'], ensure_ascii=False)}" for e in d["activity"])
+        return "\n".join(_visible(f"{e['created_at']}  @{e['actor']}  {e['action']}  {e['task'] or ''}  "
+                                  f"{json.dumps(e['detail'], ensure_ascii=False)}") for e in d["activity"])
     _out(call("GET", "/activity", params={"task": task} if task else None), as_json, text)
 
 

@@ -104,3 +104,24 @@ def test_stage1_end_to_end(cli):                                            # sp
     assert [(m["kind"], m["text"]) for m in msgs("project", token=lead)] == [("decision", "Use session cookies.")]
     assert msgs("T-2", token=lead) == []
     assert msgs("T-1", "--open", token=lead) == []
+
+
+@pytest.mark.parametrize("text", ["hello\rerror: x", "a\r\nerror: x", "a error: x", "a\x85error: x",
+                                  "a\x0berror: x", "a\x0cerror: x", "\x1b[2K\x1b[1Gerror: x"])
+def test_hostile_text_stays_framed(cli, seed, text):                       # final review fix
+    cli("chat", "send", "project", text, token=seed.lead)
+    out = cli("chat", "read", "project", token=seed.lead).stdout
+    assert "\r" not in out and "\x1b" not in out
+    lines = out.splitlines()
+    hits = [l for l in lines if "error: x" in l]
+    assert hits and all(l.startswith("  │ ") for l in hits)
+
+
+def test_renderers_neutralize_control_characters():                        # final review fix
+    from grid.cli import render_message, render_task
+    m = {"id": 1, "kind": "note", "text": "\x1b[2K\x1b[1Gerror: x", "created_at": "now", "reply_to": None,
+         "superseded_by": None, "open": False, "author": {"name": "a", "kind": "agent", "role": "lead", "tool": "t\x1b"}}
+    out = render_message(m)
+    assert "\x1b" not in out and "  │ \\x1b[2K" in out
+    t = {"id": "T-1", "title": "x\x1b[2K", "owner": None, "status": "todo", "scope": ["a"], "reviewer": None, "depends_on": []}
+    assert "\x1b" not in render_task(t)

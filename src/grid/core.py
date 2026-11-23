@@ -121,7 +121,17 @@ class Database:
 
 ROLES = ("lead", "worker", "reviewer")
 RESERVED = {"lead", "worker", "reviewer", "human", "project"}
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _single_line(value: str, field: str, limit: int) -> str:
+    """Text GRID prints outside the message frame must be one plain line."""
+    value = (value or "").strip()
+    if CONTROL_RE.search(value) or len(value) > limit:
+        raise GridError(422, f"bad_{field}", f"The {field} must be one line of at most {limit} characters, "
+                        "without control characters.")
+    return value
 JOIN_FIX = "Ask a human to run: grid join --role <role> --name <name>"
 
 
@@ -155,7 +165,7 @@ def _hash(token: str) -> str:
 
 def _new_participant(conn, project_id: int, name: str, kind: str, role: str | None,
                      tool: str) -> tuple[Participant, str]:
-    if not NAME_RE.match(name) or name in RESERVED:
+    if not NAME_RE.fullmatch(name) or name in RESERVED:
         raise GridError(422, "bad_name",
                         f"'{name}' isn't a valid name. Use 1-32 lowercase letters, digits, '-' or '_', "
                         f"not one of: {', '.join(sorted(RESERVED))}.")
@@ -174,6 +184,9 @@ def init_project(db: Database, project: str, human: str) -> tuple[Participant, s
     with db.tx() as c:
         if c.execute("SELECT 1 FROM projects").fetchone():
             raise GridError(409, "already_initialized", "This GRID database already has a project.")
+        project = _single_line(project, "project", 100)
+        if not project:
+            raise GridError(422, "bad_project", "The project needs a name.")
         pid = c.execute("INSERT INTO projects (name, created_at) VALUES (?, ?)",
                         (project, now())).lastrowid
         p, token = _new_participant(c, pid, human, "human", None, "human")
@@ -195,7 +208,7 @@ def join(db: Database, actor: Participant, *, name: str, role: str | None, human
                 raise GridError(409, "lead_exists", f"@{cur['name']} is already the lead.",
                                 f"grid revoke {cur['name']}")
         p, token = _new_participant(c, actor.project_id, name, "human" if human else "agent",
-                                    None if human else role, "human" if human else (tool or "unknown"))
+                                    None if human else role, "human" if human else (_single_line(tool, "tool", 32) or "unknown"))
         record_activity(c, actor.project_id, actor.id, "joined", {"name": p.name, "role": p.role})
         return p, token
 
@@ -208,6 +221,11 @@ def revoke(db: Database, actor: Participant, name: str) -> Participant:
         if not row:
             raise GridError(404, "no_such_participant", f"No active participant named @{name}.",
                             "grid participants")
+        humans = c.execute("SELECT count(*) FROM participants WHERE project_id=? AND kind='human' AND active=1",
+                           (actor.project_id,)).fetchone()[0]
+        if row["kind"] == "human" and humans == 1:
+            raise GridError(409, "last_human", f"@{name} is the last human; GRID needs at least one.",
+                            "grid join --human --name <name>")
         c.execute("UPDATE participants SET active=0 WHERE id=?", (row["id"],))
         record_activity(c, actor.project_id, actor.id, "revoked", {"name": name})
         return Participant.from_row(c.execute("SELECT * FROM participants WHERE id=?", (row["id"],)).fetchone())
@@ -283,12 +301,21 @@ def get_settings(db: Database, actor: Participant) -> dict:
         return _settings(c, actor.project_id)
 
 
+HUMAN_ONLY_SETTINGS = ("require_review", "loop_guard_limit")  # they exist to check agents
+
+
 def set_setting(db: Database, actor: Participant, key: str, value: int) -> dict:
     require_lead_or_human(actor, "change project settings")
     if key not in SETTINGS:
         raise GridError(422, "bad_setting", f"Unknown setting '{key}'. Valid: {', '.join(SETTINGS)}.")
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise GridError(422, "bad_setting", f"'{key}' needs a whole number of 0 or more.")
+    if key in HUMAN_ONLY_SETTINGS:
+        require_human(actor)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise GridError(422, "bad_setting", f"'{key}' needs a whole number.")
+    if key == "require_review" and value not in (0, 1):
+        raise GridError(422, "bad_setting", "require_review is 1 (on) or 0 (off).")
+    if key != "require_review" and value < 1:
+        raise GridError(422, "bad_setting", f"'{key}' needs a whole number of 1 or more.")
     with db.tx() as c:
         c.execute(f"UPDATE projects SET {key}=? WHERE id=?", (value, actor.project_id))
         record_activity(c, actor.project_id, actor.id, "setting_changed", {"key": key, "value": value})
@@ -297,20 +324,22 @@ def set_setting(db: Database, actor: Participant, key: str, value: int) -> dict:
 
 # --- scope ------------------------------------------------------------------
 
-ACTIVE = ("in progress", "in review")
+ACTIVE = ("in progress", "in review", "blocked")  # owned work in these states holds its scope
 
 
 def normalize_path(p: str) -> str:
+    """Repo-relative path with '/' separators. '.' means the whole repo."""
     raw = p
     p = p.strip().replace("\\", "/")
-    while p.startswith("./"):
-        p = p[2:]
-    p = re.sub(r"/+", "/", p).rstrip("/")
-    if not p or p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in p.split("/"):
+    segments = [seg for seg in p.split("/") if seg not in ("", ".")]
+    bad = (not p or p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in segments
+           or any(seg.startswith("~") or re.search(r"[*?\[\]]", seg) for seg in segments)
+           or CONTROL_RE.search(p))
+    if bad:
         raise GridError(422, "bad_scope",
                         f"'{raw}' isn't a usable scope path. Use a path relative to the repo root, "
-                        "without '..', like 'api/auth/'.")
-    return p
+                        "without '..', '~' or wildcards, like 'api/auth/' ('.' for the whole repo).")
+    return "/".join(segments) or "."
 
 
 def parse_scope(raw: list[str]) -> list[str]:
@@ -325,7 +354,9 @@ def parse_scope(raw: list[str]) -> list[str]:
 
 
 def paths_overlap(a: str, b: str) -> bool:
-    sa, sb = a.split("/"), b.split("/")
+    if "." in (a, b):
+        return True
+    sa, sb = a.casefold().split("/"), b.casefold().split("/")  # case-insensitive: safe on Windows/macOS
     n = min(len(sa), len(sb))
     return sa[:n] == sb[:n]
 
@@ -333,7 +364,8 @@ def paths_overlap(a: str, b: str) -> bool:
 def find_conflicts(conn, task_id: int, paths: list[str]) -> list[tuple[str, str, str]]:
     rows = conn.execute(
         "SELECT s.task_id, s.path FROM task_scope s JOIN tasks t ON t.id = s.task_id "
-        "WHERE t.status IN (?, ?) AND s.task_id != ? ORDER BY s.task_id", (*ACTIVE, task_id)).fetchall()
+        "WHERE t.status IN (?, ?, ?) AND t.owner_id IS NOT NULL AND s.task_id != ? ORDER BY s.task_id",
+        (*ACTIVE, task_id)).fetchall()
     return [(f"T-{r['task_id']}", mine, r["path"]) for mine in paths for r in rows
             if paths_overlap(mine, r["path"])]
 
@@ -402,7 +434,8 @@ def _check_overlap(conn, actor: Participant, task_id: int, paths: list[str], all
 def create_task(db: Database, actor: Participant, title: str, goal: str = "",
                 scope: list[str] | None = None) -> dict:
     require_lead_or_human(actor, "create tasks")
-    if not title.strip():
+    title = _single_line(title, "title", 200)
+    if not title:
         raise GridError(422, "bad_title", "A task needs a title.")
     paths = parse_scope(scope or [])
     with db.tx() as c:
@@ -421,7 +454,7 @@ def set_scope(db: Database, actor: Participant, task_id: int, scope: list[str],
         raise GridError(422, "no_scope", "A scope needs at least one path.")
     with db.tx() as c:
         row = _task_row(c, actor, task_id)
-        if row["status"] in ACTIVE:
+        if row["status"] in ACTIVE and row["owner_id"] is not None:
             _check_overlap(c, actor, task_id, paths, allow_overlap,
                            f"grid task scope T-{task_id} {' '.join(paths)} --allow-overlap")
         c.execute("DELETE FROM task_scope WHERE task_id=?", (task_id,))
@@ -596,15 +629,16 @@ def send_message(db: Database, actor: Participant, thread: str, text: str, kind:
 
 # --- mentions ---------------------------------------------------------------
 
-MENTION_RE = re.compile(r"(?<![\w@.])@([A-Za-z0-9][A-Za-z0-9_-]{0,31})")
+MENTION_RE = re.compile(r"(?<![\w@.])@([A-Za-z0-9][A-Za-z0-9_-]*)")
+CODE_RE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.S)
 REPORT_UP = "Workers can't message other workers. Address @lead, @reviewer, or @human, or post a proposal to @lead."
 REPORT_UP_FIX = 'grid chat send project "<text>" --propose'
 
 
 def parse_mentions(text: str) -> list[str]:
     out: list[str] = []
-    for m in MENTION_RE.finditer(text):
-        name = m.group(1).lower()
+    for m in MENTION_RE.finditer(CODE_RE.sub(" ", text)):  # code like `@dataclass` isn't a mention
+        name = m.group(1).lower().rstrip("-_")
         if name not in out:
             out.append(name)
     return out
@@ -668,7 +702,7 @@ def read_messages(db: Database, actor: Participant, thread: str, since: int = 0,
             sql += f" AND {_OPEN_SQL}"
         rows = c.execute(sql + " ORDER BY m.id LIMIT ?", (actor.project_id, task_id, since, limit + 1)).fetchall()
         more, rows = len(rows) > limit, rows[:limit]
-        if rows:
+        if rows and not open_only:  # a filtered read skips messages; don't mark them seen
             c.execute("INSERT INTO read_cursors (participant_id, project_id, task_id, last_message_id) "
                       "VALUES (?, ?, ?, ?) ON CONFLICT (participant_id, project_id, COALESCE(task_id, 0)) "
                       "DO UPDATE SET last_message_id = MAX(last_message_id, excluded.last_message_id)",
