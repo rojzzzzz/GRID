@@ -48,3 +48,13 @@ def seed(api):
         backend=_join(api, human, "backend", "worker", "codex"),
         reviewer=_join(api, human, "checker", "reviewer", "codex"),
     )
+
+
+def mk(api, seed, title, scope):
+    r = api.post("/tasks", json={"title": title, "scope": scope}, headers=Seed.h(seed.lead))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def assign(api, seed, task, owner, **kw):
+    return api.post(f"/tasks/{task['id']}/assign", json={"owner": owner, **kw}, headers=Seed.h(seed.lead))

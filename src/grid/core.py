@@ -265,3 +265,244 @@ def list_activity(db: Database, actor: Participant, task_id: int | None = None) 
     return [{"id": r["id"], "action": r["action"], "actor": r["actor"],
              "task": f"T-{r['task_id']}" if r["task_id"] else None,
              "detail": json.loads(r["detail"]), "created_at": r["created_at"]} for r in rows]
+
+
+# --- settings ---------------------------------------------------------------
+
+SETTINGS = ("require_review", "loop_guard_limit", "message_cap", "brief_budget", "collapse_todo",
+            "collapse_decisions", "collapse_questions", "collapse_proposals")
+
+
+def _settings(conn, project_id: int) -> dict:
+    row = conn.execute(f"SELECT {', '.join(SETTINGS)} FROM projects WHERE id=?", (project_id,)).fetchone()
+    return dict(row)
+
+
+def get_settings(db: Database, actor: Participant) -> dict:
+    with db.read() as c:
+        return _settings(c, actor.project_id)
+
+
+def set_setting(db: Database, actor: Participant, key: str, value: int) -> dict:
+    require_lead_or_human(actor, "change project settings")
+    if key not in SETTINGS:
+        raise GridError(422, "bad_setting", f"Unknown setting '{key}'. Valid: {', '.join(SETTINGS)}.")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise GridError(422, "bad_setting", f"'{key}' needs a whole number of 0 or more.")
+    with db.tx() as c:
+        c.execute(f"UPDATE projects SET {key}=? WHERE id=?", (value, actor.project_id))
+        record_activity(c, actor.project_id, actor.id, "setting_changed", {"key": key, "value": value})
+        return _settings(c, actor.project_id)
+
+
+# --- scope ------------------------------------------------------------------
+
+ACTIVE = ("in progress", "in review")
+
+
+def normalize_path(p: str) -> str:
+    raw = p
+    p = p.strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = re.sub(r"/+", "/", p).rstrip("/")
+    if not p or p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in p.split("/"):
+        raise GridError(422, "bad_scope",
+                        f"'{raw}' isn't a usable scope path. Use a path relative to the repo root, "
+                        "without '..', like 'api/auth/'.")
+    return p
+
+
+def parse_scope(raw: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in raw:
+        for part in re.split(r"[,\s]+", item.strip()):
+            if part:
+                p = normalize_path(part)
+                if p not in out:
+                    out.append(p)
+    return out
+
+
+def paths_overlap(a: str, b: str) -> bool:
+    sa, sb = a.split("/"), b.split("/")
+    n = min(len(sa), len(sb))
+    return sa[:n] == sb[:n]
+
+
+def find_conflicts(conn, task_id: int, paths: list[str]) -> list[tuple[str, str, str]]:
+    rows = conn.execute(
+        "SELECT s.task_id, s.path FROM task_scope s JOIN tasks t ON t.id = s.task_id "
+        "WHERE t.status IN (?, ?) AND s.task_id != ? ORDER BY s.task_id", (*ACTIVE, task_id)).fetchall()
+    return [(f"T-{r['task_id']}", mine, r["path"]) for mine in paths for r in rows
+            if paths_overlap(mine, r["path"])]
+
+
+def _describe(conflicts: list[tuple[str, str, str]]) -> str:
+    return "; ".join(f"{other} ({mine} ↔ {theirs})" for other, mine, theirs in conflicts)
+
+
+# --- tasks ------------------------------------------------------------------
+
+STATUSES = ("todo", "in progress", "in review", "blocked", "done")
+
+
+def parse_task_id(s: str | int) -> int:
+    m = re.fullmatch(r"(?:[Tt]-)?(\d+)", str(s).strip())
+    if not m:
+        raise GridError(422, "bad_task_id", f"'{s}' isn't a task id. Use the form T-12.", "grid task list")
+    return int(m.group(1))
+
+
+def _task_row(conn, actor: Participant, task_id: int):
+    row = conn.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",
+                       (task_id, actor.project_id)).fetchone()
+    if not row:
+        raise GridError(404, "no_such_task", f"There is no task T-{task_id}.", "grid task list")
+    return row
+
+
+def _name(conn, participant_id: int | None) -> str | None:
+    if participant_id is None:
+        return None
+    return conn.execute("SELECT name FROM participants WHERE id=?", (participant_id,)).fetchone()["name"]
+
+
+def _task_json(conn, row) -> dict:
+    scope = [r["path"] for r in conn.execute(
+        "SELECT path FROM task_scope WHERE task_id=? ORDER BY rowid", (row["id"],))]
+    deps = [f"T-{r['depends_on_id']}" for r in conn.execute(
+        "SELECT depends_on_id FROM task_deps WHERE task_id=? ORDER BY depends_on_id", (row["id"],))]
+    return {"id": f"T-{row['id']}", "title": row["title"], "goal": row["goal"], "status": row["status"],
+            "owner": _name(conn, row["owner_id"]), "reviewer": _name(conn, row["reviewer_id"]),
+            "scope": scope, "depends_on": deps}
+
+
+def _participant_by_name(conn, actor: Participant, name: str):
+    return conn.execute("SELECT * FROM participants WHERE project_id=? AND name=? AND active=1",
+                        (actor.project_id, name.lstrip("@").lower())).fetchone()
+
+
+def _open_deps(conn, task_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id "
+                        "WHERE d.task_id=? AND t.status != 'done'", (task_id,)).fetchone() is not None
+
+
+def _check_overlap(conn, actor: Participant, task_id: int, paths: list[str], allow: bool, fix: str) -> None:
+    conflicts = find_conflicts(conn, task_id, paths)
+    if conflicts and not allow:
+        raise GridError(409, "scope_overlap",
+                        f"T-{task_id} overlaps active work: {_describe(conflicts)}. "
+                        "Make one task depend on the other, or allow the overlap.", fix)
+    if conflicts:
+        record_activity(conn, actor.project_id, actor.id, "overlap_allowed",
+                        {"conflicts": [list(c) for c in conflicts]}, task_id)
+
+
+def create_task(db: Database, actor: Participant, title: str, goal: str = "",
+                scope: list[str] | None = None) -> dict:
+    require_lead_or_human(actor, "create tasks")
+    if not title.strip():
+        raise GridError(422, "bad_title", "A task needs a title.")
+    paths = parse_scope(scope or [])
+    with db.tx() as c:
+        tid = c.execute("INSERT INTO tasks (project_id, title, goal, created_at) VALUES (?, ?, ?, ?)",
+                        (actor.project_id, title.strip(), goal, now())).lastrowid
+        c.executemany("INSERT INTO task_scope (task_id, path) VALUES (?, ?)", [(tid, p) for p in paths])
+        record_activity(c, actor.project_id, actor.id, "task_created", {"title": title, "scope": paths}, tid)
+        return _task_json(c, _task_row(c, actor, tid))
+
+
+def set_scope(db: Database, actor: Participant, task_id: int, scope: list[str],
+              allow_overlap: bool = False) -> dict:
+    require_lead_or_human(actor, "set task scopes")
+    paths = parse_scope(scope)
+    if not paths:
+        raise GridError(422, "no_scope", "A scope needs at least one path.")
+    with db.tx() as c:
+        row = _task_row(c, actor, task_id)
+        if row["status"] in ACTIVE:
+            _check_overlap(c, actor, task_id, paths, allow_overlap,
+                           f"grid task scope T-{task_id} {' '.join(paths)} --allow-overlap")
+        c.execute("DELETE FROM task_scope WHERE task_id=?", (task_id,))
+        c.executemany("INSERT INTO task_scope (task_id, path) VALUES (?, ?)", [(task_id, p) for p in paths])
+        record_activity(c, actor.project_id, actor.id, "scope_set", {"scope": paths}, task_id)
+        return _task_json(c, row)
+
+
+def assign_task(db: Database, actor: Participant, task_id: int, owner: str,
+                allow_overlap: bool = False) -> dict:
+    require_lead_or_human(actor, "assign tasks")
+    with db.tx() as c:
+        _task_row(c, actor, task_id)
+        who = _participant_by_name(c, actor, owner)
+        if not who or who["role"] != "worker":
+            raise GridError(422, "not_a_worker", f"@{owner} isn't an active worker; only workers own tasks.",
+                            "grid participants")
+        paths = [r["path"] for r in c.execute("SELECT path FROM task_scope WHERE task_id=?", (task_id,))]
+        if not paths:
+            raise GridError(422, "no_scope", f"T-{task_id} has no scope, so overlaps can't be checked.",
+                            f'grid task scope T-{task_id} "<paths>"')
+        _check_overlap(c, actor, task_id, paths, allow_overlap,
+                       f"grid task assign T-{task_id} {who['name']} --allow-overlap")
+        status = "blocked" if _open_deps(c, task_id) else "in progress"
+        c.execute("UPDATE tasks SET owner_id=?, status=? WHERE id=?", (who["id"], status, task_id))
+        record_activity(c, actor.project_id, actor.id, "task_assigned", {"owner": who["name"]}, task_id)
+        return _task_json(c, _task_row(c, actor, task_id))
+
+
+def add_dependency(db: Database, actor: Participant, task_id: int, on: int) -> dict:
+    require_lead_or_human(actor, "add dependencies")
+    with db.tx() as c:
+        row = _task_row(c, actor, task_id)
+        _task_row(c, actor, on)
+        seen, stack = set(), [on]
+        while stack:  # walk what `on` depends on; reaching task_id means a loop
+            cur = stack.pop()
+            if cur == task_id:
+                raise GridError(422, "dependency_cycle",
+                                f"T-{task_id} can't depend on T-{on}: that would make a loop.")
+            if cur not in seen:
+                seen.add(cur)
+                stack += [r[0] for r in c.execute("SELECT depends_on_id FROM task_deps WHERE task_id=?", (cur,))]
+        c.execute("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?)", (task_id, on))
+        if row["status"] == "in progress" and _open_deps(c, task_id):
+            c.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        record_activity(c, actor.project_id, actor.id, "dependency_added", {"on": f"T-{on}"}, task_id)
+        return _task_json(c, _task_row(c, actor, task_id))
+
+
+def set_reviewer(db: Database, actor: Participant, task_id: int, reviewer: str) -> dict:
+    require_lead_or_human(actor, "assign reviewers")
+    with db.tx() as c:
+        row = _task_row(c, actor, task_id)
+        who = _participant_by_name(c, actor, reviewer)
+        if not who or who["role"] not in ("reviewer", "lead") or who["id"] == row["owner_id"]:
+            raise GridError(422, "bad_reviewer",
+                            f"@{reviewer} can't review T-{task_id}. A reviewer must be an active reviewer "
+                            "or the lead, and never the task's owner.", "grid participants")
+        c.execute("UPDATE tasks SET reviewer_id=? WHERE id=?", (who["id"], task_id))
+        record_activity(c, actor.project_id, actor.id, "reviewer_set", {"reviewer": who["name"]}, task_id)
+        return _task_json(c, _task_row(c, actor, task_id))
+
+
+def set_status(db: Database, actor: Participant, task_id: int, status: str) -> dict:
+    require_human(actor)
+    if status not in STATUSES:
+        raise GridError(422, "bad_status", f"Status must be one of: {', '.join(STATUSES)}.")
+    with db.tx() as c:
+        _task_row(c, actor, task_id)
+        c.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+        record_activity(c, actor.project_id, actor.id, "status_set", {"status": status}, task_id)
+        return _task_json(c, _task_row(c, actor, task_id))
+
+
+def get_task(db: Database, actor: Participant, task_id: int) -> dict:
+    with db.read() as c:
+        return _task_json(c, _task_row(c, actor, task_id))
+
+
+def list_tasks(db: Database, actor: Participant) -> list[dict]:
+    with db.read() as c:
+        rows = c.execute("SELECT * FROM tasks WHERE project_id=? ORDER BY id", (actor.project_id,)).fetchall()
+        return [_task_json(c, r) for r in rows]

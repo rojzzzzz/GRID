@@ -56,4 +56,48 @@ def create_app(db_path: Path) -> FastAPI:
         tid = core.parse_task_id(task) if task else None
         return {"activity": core.list_activity(db, actor, tid)}
 
+    # settings
+    @app.get("/project/settings")
+    def settings(actor: Participant = Depends(me)):
+        return core.get_settings(db, actor)
+
+    @app.patch("/project/settings")
+    def set_setting(body: dict, actor: Participant = Depends(me)):
+        return core.set_setting(db, actor, body.get("key", ""), body.get("value"))
+
+    # tasks
+    @app.post("/tasks")
+    def create_task(body: dict, actor: Participant = Depends(me)):
+        return core.create_task(db, actor, body.get("title", ""), body.get("goal", ""), body.get("scope") or [])
+
+    @app.get("/tasks")
+    def list_tasks(actor: Participant = Depends(me)):
+        return {"tasks": core.list_tasks(db, actor)}
+
+    @app.get("/tasks/{tid}")
+    def get_task(tid: str, actor: Participant = Depends(me)):
+        return core.get_task(db, actor, core.parse_task_id(tid))
+
+    @app.put("/tasks/{tid}/scope")
+    def set_scope(tid: str, body: dict, actor: Participant = Depends(me)):
+        return core.set_scope(db, actor, core.parse_task_id(tid), body.get("scope") or [],
+                              bool(body.get("allow_overlap")))
+
+    @app.post("/tasks/{tid}/assign")
+    def assign(tid: str, body: dict, actor: Participant = Depends(me)):
+        return core.assign_task(db, actor, core.parse_task_id(tid), body.get("owner", ""),
+                                bool(body.get("allow_overlap")))
+
+    @app.post("/tasks/{tid}/depends")
+    def depends(tid: str, body: dict, actor: Participant = Depends(me)):
+        return core.add_dependency(db, actor, core.parse_task_id(tid), core.parse_task_id(body.get("on", "")))
+
+    @app.post("/tasks/{tid}/reviewer")
+    def reviewer(tid: str, body: dict, actor: Participant = Depends(me)):
+        return core.set_reviewer(db, actor, core.parse_task_id(tid), body.get("reviewer", ""))
+
+    @app.post("/tasks/{tid}/status")
+    def status(tid: str, body: dict, actor: Participant = Depends(me)):
+        return core.set_status(db, actor, core.parse_task_id(tid), body.get("status", ""))
+
     return app
