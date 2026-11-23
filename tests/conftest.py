@@ -69,3 +69,20 @@ def read(api, token, thread, open=False):
     r = api.get(f"/threads/{thread}/messages", params=params, headers=Seed.h(token))
     assert r.status_code == 200, r.text
     return r.json()["messages"]
+
+
+@pytest.fixture
+def cli(api, monkeypatch):
+    from typer.testing import CliRunner
+
+    from grid import cli as grid_cli
+
+    grid_cli.set_client_factory(lambda: api)
+    runner = CliRunner()
+
+    def run(*args, token=None):
+        env = {"GRID_TOKEN": token} if token else {"GRID_TOKEN": ""}
+        return runner.invoke(grid_cli.app, list(args), env=env)
+
+    yield run
+    grid_cli.set_client_factory(None)
