@@ -1,0 +1,22 @@
+[project]
+name = "grid"
+version = "0.1.0"
+description = "GRID conversation system: shared threads and briefs for humans and AI agents"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "uvicorn", "typer", "httpx"]
+
+[project.scripts]
+grid = "grid.cli:app"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grid"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
